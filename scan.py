@@ -1,61 +1,85 @@
-import asyncio
+import subprocess
 import ipaddress
+import random
+import concurrent.futures
+import time
 
-# --- НАСТРОЙКИ ---
+# --- НАСТРОЙКИ (как в твоем скрипте) ---
 INPUT_FILE = 'ip_cidr'
-OUTPUT_FILE = 'alive.txt'
-CONCURRENT_LIMIT = 50  # Количество одновременных проверок (начни с 50)
-TIMEOUT = 1.0           # Таймаут в секундах
-# -----------------
+OUTPUT_FILE = 'alive_subnets.txt'
+NUM_IPS_TO_TEST = 5  # Сколько случайных IP проверять в одной подсети
+TIMEOUT = 2          # Таймаут пинга
+THREADS = 20         # Количество потоков
+# ---------------------------------------
 
-async def check_ip(ip, semaphore):
-    """Проверяет IP с использованием системной команды ping, но асинхронно"""
-    async with semaphore:
-        ip_str = str(ip)
-        # Асинхронный запуск процесса
-        proc = await asyncio.create_subprocess_exec(
-            'ping', '-c', '1', '-W', str(int(TIMEOUT)), ip_str,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-        await proc.wait()
-        if proc.returncode == 0:
-            return ip_str
-    return None
-
-async def main():
-    semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
-    
+def check_ping(ip, timeout):
+    # Пинг 2 пакета, как в твоем исходнике
+    cmd = ['ping', '-c', '2', '-W', str(timeout), str(ip)]
     try:
-        with open(INPUT_FILE, 'r') as f, open(OUTPUT_FILE, 'a') as out_file:
-            for line in f:
-                line = line.strip()
-                if not line: continue
-                
-                print(f"[*] Сканирую подсеть: {line}")
-                try:
-                    network = ipaddress.ip_network(line, strict=False)
-                    tasks = []
-                    
-                    # Создаем задачи для всех IP в подсети
-                    for ip in network:
-                        tasks.append(check_ip(ip, semaphore))
-                    
-                    # Запускаем задачи и обрабатываем по мере готовности
-                    for result in asyncio.as_completed(tasks):
-                        ip_found = await result
-                        if ip_found:
-                            print(f"[+] {ip_found} доступен")
-                            out_file.write(ip_found + '\n')
-                            out_file.flush()
-                            
-                except Exception as e:
-                    print(f"[!] Ошибка в {line}: {e}")
-                    
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0
+    except:
+        return False
+
+def get_ips_to_test(cidr_str, num_ips):
+    try:
+        network = ipaddress.IPv4Network(cidr_str.strip(), strict=False)
+        total_ips = network.num_addresses
+        
+        if total_ips <= num_ips:
+            return list(network)
+        
+        # Выбираем случайные IP, чтобы не сканировать всю сеть /14
+        indices = random.sample(range(total_ips), num_ips)
+        return [network[i] for i in indices]
+    except:
+        return []
+
+def evaluate_subnet(cidr_str):
+    ips = get_ips_to_test(cidr_str, NUM_IPS_TO_TEST)
+    if not ips:
+        return cidr_str, False
+
+    # Если хотя бы один IP из выборки ответил — подсеть жива
+    for ip in ips:
+        if check_ping(ip, TIMEOUT):
+            return cidr_str, True
+    return cidr_str, False
+
+def main():
+    tasks = []
+    try:
+        with open(INPUT_FILE, 'r') as f:
+            tasks = [line.strip() for line in f if line.strip() and not line.startswith('#')]
     except FileNotFoundError:
-        print(f"[-] Файл {INPUT_FILE} не найден")
-    except KeyboardInterrupt:
-        print("\n[!] Остановлено.")
+        print(f"Файл {INPUT_FILE} не найден!")
+        return
+
+    print(f"[*] Начинаю проверку {len(tasks)} подсетей...")
+    print(f"[*] Режим: {NUM_IPS_TO_TEST} случайных IP на каждую сеть.")
+
+    start_time = time.time()
+    alive_count = 0
+
+    with open(OUTPUT_FILE, 'w') as out_file:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as executor:
+            future_to_subnet = {executor.submit(evaluate_subnet, cidr): cidr for cidr in tasks}
+            
+            for i, future in enumerate(concurrent.futures.as_completed(future_to_subnet)):
+                subnet, is_reachable = future.result()
+                
+                status = "\033[1;32m[+]\033[0m" if is_reachable else "\033[1;31m[-]\033[0m"
+                print(f"{status} {subnet:<18} проверено {i+1}/{len(tasks)}")
+                
+                if is_reachable:
+                    out_file.write(subnet + '\n')
+                    out_file.flush()
+                    alive_count += 1
+
+    end_time = time.time()
+    print(f"\n[*] Готово! Доступно подсетей: {alive_count}")
+    print(f"[*] Результаты сохранены в: {OUTPUT_FILE}")
+    print(f"[*] Время выполнения: {int(end_time - start_time)} сек.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
