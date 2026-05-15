@@ -1,4 +1,4 @@
-#!/bin/bash#!/bin/bash
+#!/bin/bash
 
 INPUT_FILE="ip_cidr"
 ALIVE_FILE="alive.txt"
